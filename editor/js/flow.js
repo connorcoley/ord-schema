@@ -16,12 +16,16 @@
 
 goog.module('ord.flows');
 goog.module.declareLegacyNamespace();
-exports = {load, unload, validateFlow};
+exports = {
+  load,
+  unload,
+  validateFlow
+};
 
 goog.require('proto.ord.FlowConditions');
 goog.require('proto.ord.FlowConditions.Tubing');
 
-function load (flow) {
+function load(flow) {
   const type = flow.getFlowType();
   if (type) {
     setSelector($('#flow_type'), type.getType());
@@ -35,7 +39,7 @@ function load (flow) {
   writeMetric('#flow_tubing', tubing.getDiameter());
 };
 
-function unload () {
+function unload() {
   const flow = new proto.ord.FlowConditions();
 
   const type = new proto.ord.FlowConditions.FlowType();

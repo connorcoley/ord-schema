@@ -71,7 +71,8 @@ exports = {
   unload: function() {
     const electro = new proto.ord.ElectrochemistryConditions();
 
-    const type = new proto.ord.ElectrochemistryConditions.ElectrochemistryType();
+    const type =
+        new proto.ord.ElectrochemistryConditions.ElectrochemistryType();
     type.setType(getSelector($('#electro_type')));
     type.setDetails($('#electro_details').text());
     if (!isEmptyMessage(type)) {
@@ -94,7 +95,8 @@ exports = {
       electro.setElectrodeSeparation(electrodeSeparation);
     }
 
-    const cell = new proto.ord.ElectrochemistryConditions.ElectrochemistryCell();
+    const cell =
+        new proto.ord.ElectrochemistryConditions.ElectrochemistryCell();
     cell.setType(getSelector($('#electro_cell_type')));
     cell.setDetails($('#electro_cell_details').text());
     if (!isEmptyMessage(cell)) {
