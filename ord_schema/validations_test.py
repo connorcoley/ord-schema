@@ -72,7 +72,9 @@ class ValidationsTest(parameterized.TestCase, absltest.TestCase):
         ('mass', reaction_pb2.Mass(value=32.1, units=reaction_pb2.Mass.GRAM)),
     )
     def test_units(self, message):
-        self.assertEmpty(self._run_validation(message))
+        output = self._run_validation(message)
+        self.assertEmpty(output.errors)
+        self.assertEmpty(output.warnings)
 
     @parameterized.named_parameters(
         ('neg volume',
@@ -83,8 +85,6 @@ class ValidationsTest(parameterized.TestCase, absltest.TestCase):
         ('neg mass', reaction_pb2.Mass(
             value=-32.1, units=reaction_pb2.Mass.GRAM), 'non-negative'),
         ('no units', reaction_pb2.FlowRate(value=5), 'units'),
-        ('percentage out of range', reaction_pb2.Percentage(value=200),
-         'between'),
         ('low temperature', reaction_pb2.Temperature(
             value=-5, units='KELVIN'), 'between'),
         ('low temperature 2',
@@ -97,7 +97,9 @@ class ValidationsTest(parameterized.TestCase, absltest.TestCase):
 
     def test_orcid(self):
         message = reaction_pb2.Person(orcid='0000-0001-2345-678X')
-        self.assertEmpty(self._run_validation(message))
+        output = self._run_validation(message)
+        self.assertEmpty(output.errors)
+        self.assertEmpty(output.warnings)
 
     def test_orcid_should_fail(self):
         message = reaction_pb2.Person(orcid='abcd-0001-2345-678X')
@@ -109,7 +111,9 @@ class ValidationsTest(parameterized.TestCase, absltest.TestCase):
     ])
     def test_email(self, email):
         message = reaction_pb2.Person(email=email)
-        self.assertEmpty(self._run_validation(message))
+        output = self._run_validation(message)
+        self.assertEmpty(output.errors)
+        self.assertEmpty(output.warnings)
 
     @parameterized.parameters(
         ['bad&character@gmail.com', 'not-an-email', 'bad@domain'])
@@ -121,7 +125,9 @@ class ValidationsTest(parameterized.TestCase, absltest.TestCase):
     def test_synthesized_compound(self):
         message = reaction_pb2.CompoundPreparation(
             type='SYNTHESIZED', reaction_id='dummy_reaction_id')
-        self.assertEmpty(self._run_validation(message))
+        output = self._run_validation(message)
+        self.assertEmpty(output.errors)
+        self.assertEmpty(output.warnings)
         message = reaction_pb2.CompoundPreparation(
             type='NONE', reaction_id='dummy_reaction_id')
         with self.assertRaisesRegex(validations.ValidationError,
@@ -141,7 +147,27 @@ class ValidationsTest(parameterized.TestCase, absltest.TestCase):
             self._run_validation(message)
         message = reaction_pb2.CrudeComponent(reaction_id='my_reaction_id',
                                               has_derived_amount=True)
-        self.assertEmpty(self._run_validation(message))
+        output = self._run_validation(message)
+        self.assertEmpty(output.errors)
+        self.assertEmpty(output.warnings)
+
+    def test_product_measurement(self):
+        message = reaction_pb2.ProductMeasurement(analysis_key='my_analysis',
+                                                  type='YIELD',
+                                                  float_value=dict(value=60))
+        with self.assertRaisesRegex(validations.ValidationError, 'percentage'):
+            self._run_validation(message)
+        message = reaction_pb2.ProductMeasurement(analysis_key='my_analysis',
+                                                  type='AREA',
+                                                  string_value='35.221')
+        with self.assertRaisesRegex(validations.ValidationError, 'numeric'):
+            self._run_validation(message)
+        message = reaction_pb2.ProductMeasurement(analysis_key='my_analysis',
+                                                  type='YIELD',
+                                                  percentage=dict(value=60),
+                                                  selectivity=dict(type='EE'))
+        with self.assertRaisesRegex(validations.ValidationError, 'selectivity'):
+            self._run_validation(message)
 
     def test_reaction(self):
         message = reaction_pb2.Reaction()
@@ -149,6 +175,27 @@ class ValidationsTest(parameterized.TestCase, absltest.TestCase):
                                     'reaction input'):
             self._run_validation(message)
 
+    def test_reaction_smiles(self):
+        message = reaction_pb2.Reaction()
+        message.identifiers.add(value='C>>C', type='REACTION_SMILES')
+        output = self._run_validation(message)
+        self.assertEmpty(output.errors)
+        self.assertEmpty(output.warnings)
+        # Now disable the exception for reaction SMILES only.
+        options = validations.ValidationOptions()
+        options.allow_reaction_smiles_only = False
+        with self.assertRaisesRegex(validations.ValidationError,
+                                    'reaction input'):
+            self._run_validation(message, options=options)
+
+    def test_bad_reaction_smiles(self):
+        message = reaction_pb2.Reaction()
+        message.identifiers.add(value='test', type='REACTION_SMILES')
+        with self.assertRaisesRegex(validations.ValidationError,
+                                    'requires at least two > characters'):
+            self._run_validation(message)
+
+    # pylint: disable=too-many-statements
     def test_reaction_recursive(self):
         message = reaction_pb2.Reaction()
         # Reactions must have at least one input
@@ -161,7 +208,9 @@ class ValidationsTest(parameterized.TestCase, absltest.TestCase):
                                     'reaction outcome'):
             self._run_validation(message, recurse=False)
         outcome = message.outcomes.add()
-        self.assertEmpty(self._run_validation(message, recurse=False))
+        output = self._run_validation(message, recurse=False)
+        self.assertEmpty(output.errors)
+        self.assertEmpty(output.warnings)
         # Inputs must have at least one component
         with self.assertRaisesRegex(validations.ValidationError, 'component'):
             self._run_validation(message)
@@ -179,24 +228,32 @@ class ValidationsTest(parameterized.TestCase, absltest.TestCase):
         with self.assertRaisesRegex(validations.ValidationError,
                                     'require an amount'):
             self._run_validation(message)
-        dummy_component.mass.value = 1
-        dummy_component.mass.units = reaction_pb2.Mass.GRAM
+        dummy_component.amount.mass.value = 1
+        dummy_component.amount.mass.units = reaction_pb2.Mass.GRAM
         # Reactions don't require defined products or conversion because they
         # can be used to prepare crude for a second Reaction
-        self.assertEmpty(self._run_validation(message))
+        output = self._run_validation(message)
+        self.assertEmpty(output.errors)
+        self.assertLen(output.warnings, 1)
         outcome.conversion.value = 75
         # If converseions are defined, must have limiting reagent flag
         with self.assertRaisesRegex(validations.ValidationError, 'is_limiting'):
             self._run_validation(message)
         dummy_component.is_limiting = True
-        self.assertEmpty(self._run_validation(message))
+        output = self._run_validation(message)
+        self.assertEmpty(output.errors)
+        self.assertEmpty(output.warnings)
 
-        # If an analysis uses an internal standard, a component must have
+        # If a measurement uses an internal standard, a component must have
         # an INTERNAL_STANDARD reaction role
         outcome.analyses['dummy_analysis'].CopyFrom(
-            reaction_pb2.ReactionAnalysis(type='CUSTOM',
-                                          details='test',
-                                          uses_internal_standard=True))
+            reaction_pb2.Analysis(type='CUSTOM', details='test'))
+        product = outcome.products.add(
+            identifiers=[dict(type='SMILES', value='c1ccccc1')])
+        product.measurements.add(analysis_key='dummy_analysis',
+                                 type='YIELD',
+                                 percentage=dict(value=75),
+                                 uses_internal_standard=True)
         with self.assertRaisesRegex(validations.ValidationError,
                                     'INTERNAL_STANDARD'):
             self._run_validation(message)
@@ -204,23 +261,27 @@ class ValidationsTest(parameterized.TestCase, absltest.TestCase):
         message_input_istd = reaction_pb2.Reaction()
         message_input_istd.CopyFrom(message)
         message_input_istd.inputs['dummy_input'].components[0].reaction_role = (
-            reaction_pb2.Compound.ReactionRole.INTERNAL_STANDARD)
-        self.assertEmpty(self._run_validation(message_input_istd))
+            reaction_pb2.ReactionRole.INTERNAL_STANDARD)
+        output = self._run_validation(message_input_istd)
+        self.assertEmpty(output.errors)
+        self.assertEmpty(output.warnings)
         # Assigning internal standard role to workup should resolve the error
         message_workup_istd = reaction_pb2.Reaction()
         message_workup_istd.CopyFrom(message)
-        workup = message_workup_istd.workup.add(type='CUSTOM', details='test')
+        workup = message_workup_istd.workups.add(type='CUSTOM', details='test')
         istd = workup.input.components.add()
         istd.identifiers.add(type='SMILES', value='CCO')
-        istd.mass.value = 1
-        istd.mass.units = reaction_pb2.Mass.GRAM
-        istd.reaction_role = istd.ReactionRole.INTERNAL_STANDARD
-        self.assertEmpty(self._run_validation(message_workup_istd))
+        istd.amount.mass.value = 1
+        istd.amount.mass.units = reaction_pb2.Mass.GRAM
+        istd.reaction_role = reaction_pb2.ReactionRole.INTERNAL_STANDARD
+        output = self._run_validation(message_workup_istd)
+        self.assertEmpty(output.errors)
+        self.assertEmpty(output.warnings)
 
     def test_reaction_recursive_noraise_on_error(self):
         message = reaction_pb2.Reaction()
         message.inputs['dummy_input'].components.add()
-        errors = self._run_validation(message, raise_on_error=False)
+        output = self._run_validation(message, raise_on_error=False)
         expected = [
             ('Reaction.inputs["dummy_input"].components[0]: '
              'Compounds must have at least one identifier'),
@@ -228,7 +289,8 @@ class ValidationsTest(parameterized.TestCase, absltest.TestCase):
              'Reaction input components require an amount'),
             'Reaction: Reactions should have at least 1 reaction outcome',
         ]
-        self.assertEqual(errors, expected)
+        self.assertEqual(output.errors, expected)
+        self.assertLen(output.warnings, 1)
 
     def test_datetimes(self):
         message = reaction_pb2.ReactionProvenance()
@@ -239,14 +301,19 @@ class ValidationsTest(parameterized.TestCase, absltest.TestCase):
         with self.assertRaisesRegex(validations.ValidationError, 'after'):
             self._run_validation(message)
         message.record_created.time.value = '2020-01-03'
-        self.assertEmpty(self._run_validation(message))
+        output = self._run_validation(message)
+        self.assertEmpty(output.errors)
+        self.assertEmpty(output.warnings)
 
     def test_reaction_id(self):
         message = reaction_pb2.Reaction()
         _ = message.inputs['test']
         message.outcomes.add()
         message.reaction_id = 'ord-c0bbd41f095a44a78b6221135961d809'
-        self.assertEmpty(self._run_validation(message, recurse=False))
+        options = validations.ValidationOptions(validate_ids=True)
+        output = self._run_validation(message, recurse=False, options=options)
+        self.assertEmpty(output.errors)
+        self.assertEmpty(output.warnings)
 
     @parameterized.named_parameters(
         ('too short', 'ord-c0bbd41f095a4'),
@@ -255,13 +322,24 @@ class ValidationsTest(parameterized.TestCase, absltest.TestCase):
         ('bad capitalization', 'ord-C0BBD41F095A44A78B6221135961D809'),
         ('bad characters', 'ord-h0bbd41f095a44a78b6221135961d809'),
         ('bad characters 2', 'ord-notARealId'),
+        ('empty', ''),
     )
     def test_bad_reaction_id(self, reaction_id):
         message = reaction_pb2.Reaction(reaction_id=reaction_id)
         _ = message.inputs['test']
         message.outcomes.add()
+        options = validations.ValidationOptions(validate_ids=True)
         with self.assertRaisesRegex(validations.ValidationError, 'malformed'):
-            self._run_validation(message, recurse=False, validate_ids=True)
+            self._run_validation(message, recurse=False, options=options)
+
+    def test_missing_provenance(self):
+        message = reaction_pb2.Reaction()
+        _ = message.inputs['test']
+        message.outcomes.add()
+        options = validations.ValidationOptions(require_provenance=True)
+        with self.assertRaisesRegex(validations.ValidationError,
+                                    'requires provenance'):
+            self._run_validation(message, recurse=False, options=options)
 
     def test_data(self):
         message = reaction_pb2.Data()
@@ -273,25 +351,30 @@ class ValidationsTest(parameterized.TestCase, absltest.TestCase):
                                     'format is required'):
             self._run_validation(message)
         message.string_value = 'test data'
-        self.assertEmpty(self._run_validation(message))
+        output = self._run_validation(message)
+        self.assertEmpty(output.errors)
+        self.assertEmpty(output.warnings)
 
     def test_dataset_bad_reaction_id(self):
         message = dataset_pb2.Dataset(reaction_ids=['foo'])
+        options = validations.ValidationOptions(validate_ids=True)
         with self.assertRaisesRegex(validations.ValidationError, 'malformed'):
-            self._run_validation(message, validate_ids=True)
+            self._run_validation(message, options=options)
 
     def test_dataset_records_and_ids(self):
         message = dataset_pb2.Dataset(
             reactions=[reaction_pb2.Reaction()],
             reaction_ids=['ord-c0bbd41f095a44a78b6221135961d809'])
+        options = validations.ValidationOptions(validate_ids=True)
         with self.assertRaisesRegex(validations.ValidationError, 'not both'):
-            self._run_validation(message, recurse=False, validate_ids=True)
+            self._run_validation(message, recurse=False, options=options)
 
     def test_dataset_bad_id(self):
         message = dataset_pb2.Dataset(reactions=[reaction_pb2.Reaction()],
                                       dataset_id='foo')
+        options = validations.ValidationOptions(validate_ids=True)
         with self.assertRaisesRegex(validations.ValidationError, 'malformed'):
-            self._run_validation(message, recurse=False, validate_ids=True)
+            self._run_validation(message, recurse=False, options=options)
 
     def test_dataset_example(self):
         message = dataset_pb2.DatasetExample()
@@ -309,7 +392,9 @@ class ValidationsTest(parameterized.TestCase, absltest.TestCase):
         message.created.time.value = '11 am'
         message.created.person.name = 'test'
         message.created.person.email = 'test@example.com'
-        self.assertEmpty(self._run_validation(message))
+        output = self._run_validation(message)
+        self.assertEmpty(output.errors)
+        self.assertEmpty(output.warnings)
 
     def test_dataset_crossreferences(self):
         message = dataset_pb2.Dataset()
@@ -323,14 +408,15 @@ class ValidationsTest(parameterized.TestCase, absltest.TestCase):
         dummy_component.identifiers.add(type='CUSTOM')
         dummy_component.identifiers[0].details = 'custom_identifier'
         dummy_component.identifiers[0].value = 'custom_value'
-        dummy_component.mass.value = 1
-        dummy_component.mass.units = reaction_pb2.Mass.GRAM
+        dummy_component.amount.mass.value = 1
+        dummy_component.amount.mass.units = reaction_pb2.Mass.GRAM
         reaction2.CopyFrom(reaction1)
         reaction3.CopyFrom(reaction1)
-
         # It is not required to cross-reference SYNTHESIZED compounds.
         dummy_component.preparations.add(type='SYNTHESIZED')
-        self.assertEmpty(self._run_validation(message))
+        output = self._run_validation(message)
+        self.assertEmpty(output.errors)
+        self.assertLen(output.warnings, 3)
         # References must refer to ID within this dataset.
         dummy_component.preparations[0].reaction_id = 'placeholder_id'
         with self.assertRaisesRegex(validations.ValidationError,
@@ -343,7 +429,9 @@ class ValidationsTest(parameterized.TestCase, absltest.TestCase):
         # Valid reference
         reaction1.reaction_id = ''
         reaction2.reaction_id = 'placeholder_id'
-        self.assertEmpty(self._run_validation(message))
+        output = self._run_validation(message)
+        self.assertEmpty(output.errors)
+        self.assertLen(output.warnings, 3)
         # Duplicate IDs not allowed
         reaction3.reaction_id = 'placeholder_id'
         with self.assertRaisesRegex(validations.ValidationError, 'same IDs'):
@@ -356,7 +444,9 @@ class ValidationsTest(parameterized.TestCase, absltest.TestCase):
                                     'undefined reaction_ids'):
             self._run_validation(message)
         reaction3.reaction_id = 'crude-making step'
-        self.assertEmpty(self._run_validation(message))
+        output = self._run_validation(message)
+        self.assertEmpty(output.errors)
+        self.assertLen(output.warnings, 3)
 
 
 if __name__ == '__main__':

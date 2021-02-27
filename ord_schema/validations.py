@@ -13,9 +13,11 @@
 # limitations under the License.
 """Helpers validating specific Message types."""
 
+import dataclasses
 import math
 import os
 import re
+from typing import Any, List, Mapping, Optional, Set, Tuple
 import warnings
 
 from absl import logging
@@ -23,19 +25,45 @@ from dateutil import parser
 from rdkit import Chem
 from rdkit import __version__ as RDKIT_VERSION
 
+import ord_schema
 from ord_schema import message_helpers
 from ord_schema.proto import dataset_pb2
 from ord_schema.proto import reaction_pb2
 
+# pylint: disable=too-many-branches
 
-def validate_datasets(datasets, write_errors=False, validate_ids=False):
+
+@dataclasses.dataclass
+class ValidationOptions:
+    """Options for message validation."""
+    # Check that Dataset and Reaction IDs are well-formed.
+    validate_ids: bool = False
+    # Require ReactionProvenance for Reactions.
+    require_provenance: bool = False
+    # Allow reactions with valid reaction SMILES and nothing else.
+    allow_reaction_smiles_only: bool = True
+
+
+@dataclasses.dataclass
+class ValidationOutput:
+    """Validation output: errors and warnings."""
+    errors: List[str] = dataclasses.field(default_factory=list)
+    warnings: List[str] = dataclasses.field(default_factory=list)
+
+    def extend(self, other):
+        self.errors.extend(other.errors)
+        self.warnings.extend(other.warnings)
+
+
+def validate_datasets(datasets: Mapping[str, dataset_pb2.Dataset],
+                      write_errors: bool = False,
+                      options: Optional[ValidationOptions] = None):
     """Runs validation for a set of datasets.
 
     Args:
         datasets: Dict mapping text filenames to Dataset protos.
         write_errors: If True, errors are written to disk.
-        validate_ids: A boolean that controls whether the IDs of Reactions or
-            Datasets should be checked for validity. Defaults to False.
+        options: ValidationOptions.
 
     Raises:
         ValidationError: if any Dataset does not pass validation.
@@ -43,9 +71,7 @@ def validate_datasets(datasets, write_errors=False, validate_ids=False):
     all_errors = []
     for filename, dataset in datasets.items():
         basename = os.path.basename(filename)
-        errors = _validate_datasets(dataset,
-                                    label=basename,
-                                    validate_ids=validate_ids)
+        errors = _validate_datasets(dataset, label=basename, options=options)
         if errors:
             for error in errors:
                 all_errors.append(f'{filename}: {error}')
@@ -60,29 +86,30 @@ def validate_datasets(datasets, write_errors=False, validate_ids=False):
         raise ValidationError(f'validation encountered errors:\n{error_string}')
 
 
-def _validate_datasets(dataset, label='dataset', validate_ids=False):
+def _validate_datasets(
+        dataset: dataset_pb2.Dataset,
+        label: str = 'dataset',
+        options: Optional[ValidationOptions] = None) -> List[str]:
     """Validates Reaction messages and cross-references in a Dataset.
 
     Args:
         dataset: dataset_pb2.Dataset message.
         label: string label for logging purposes only.
-        validate_ids: A boolean that controls whether the IDs of Reactions or
-            Datasets should be checked for validity. Defaults to False.
+        options: ValidationOptions.
 
     Returns:
         List of validation error messages.
     """
-
     errors = []
     # Reaction-level validation.
     num_bad_reactions = 0
     for i, reaction in enumerate(dataset.reactions):
-        reaction_errors = validate_message(reaction,
+        reaction_output = validate_message(reaction,
                                            raise_on_error=False,
-                                           validate_ids=validate_ids)
-        if reaction_errors:
+                                           options=options)
+        if reaction_output.errors:
             num_bad_reactions += 1
-        for error in reaction_errors:
+        for error in reaction_output.errors:
             errors.append(error)
             logging.warning('Validation error for %s[%d]: %s', label, i, error)
     logging.info('Validation summary for %s: %d/%d successful (%d failures)',
@@ -90,22 +117,23 @@ def _validate_datasets(dataset, label='dataset', validate_ids=False):
                  len(dataset.reactions) - num_bad_reactions,
                  len(dataset.reactions), num_bad_reactions)
     # Dataset-level validation of cross-references.
-    dataset_errors = validate_message(dataset,
+    dataset_output = validate_message(dataset,
                                       raise_on_error=False,
                                       recurse=False,
-                                      validate_ids=validate_ids)
-    for error in dataset_errors:
+                                      options=options)
+    for error in dataset_output.errors:
         errors.append(error)
         logging.warning('Validation error for %s: %s', label, error)
 
     return errors
 
 
-def validate_message(message,
-                     recurse=True,
-                     raise_on_error=True,
-                     validate_ids=False,
-                     trace=None):
+def validate_message(
+        message: ord_schema.Message,
+        recurse: bool = True,
+        raise_on_error: bool = True,
+        options: Optional[ValidationOptions] = None,
+        trace: Optional[Tuple[str, ...]] = None) -> ValidationOutput:
     """Template function for validating custom messages in the reaction_pb2.
 
     Messages are not validated to check enum values, since these are enforced
@@ -124,29 +152,28 @@ def validate_message(message,
         raise_on_error: If True, raises a ValidationError exception when errors
             are encountered. If False, the user must manually check the return
             value to identify validation errors.
-        validate_ids: A boolean that controls whether the IDs of Reactions or
-            Datasets should be checked for validity. Defaults to False.
+        options: ValidationOptions.
         trace: Tuple containing a string "stack trace" to track the position of
             the current message relative to the recursion root.
 
     Returns:
-        List of text validation errors, if any.
+        ValidationOutput.
 
     Raises:
         ValidationError: If any fields are invalid.
     """
     if trace is None:
         trace = (message.DESCRIPTOR.name,)
-    errors = []
+    output = ValidationOutput()
     # Recurse through submessages
     if recurse:
         for field, value in message.ListFields():
             if field.type == field.TYPE_MESSAGE:  # need to recurse
                 _validate_message(field=field,
                                   value=value,
-                                  errors=errors,
+                                  output=output,
                                   raise_on_error=raise_on_error,
-                                  validate_ids=validate_ids,
+                                  options=options,
                                   trace=trace)
 
     # Message-specific validation
@@ -159,9 +186,8 @@ def validate_message(message,
         raise NotImplementedError(f"Don't know how to validate {type(message)}")
 
     with warnings.catch_warnings(record=True) as tape:
-        if validate_ids and isinstance(
-                message, (reaction_pb2.Reaction, dataset_pb2.Dataset)):
-            _VALIDATOR_SWITCH[type(message)](message, validate_id=True)
+        if isinstance(message, (reaction_pb2.Reaction, dataset_pb2.Dataset)):
+            _VALIDATOR_SWITCH[type(message)](message, options=options)
         else:
             _VALIDATOR_SWITCH[type(message)](message)
     stack = '.'.join(trace)
@@ -170,25 +196,25 @@ def validate_message(message,
         if issubclass(warning.category, ValidationError):
             if raise_on_error:
                 raise ValidationError(message)
-            errors.append(message)
+            output.errors.append(message)
         else:
-            warnings.warn(message)
-    return errors
+            output.warnings.append(message)
+    return output
 
 
-def _validate_message(field, value, errors, raise_on_error, validate_ids,
-                      trace):
+def _validate_message(field: ord_schema.FieldDescriptor, value: Any,
+                      output: ValidationOutput, raise_on_error: bool,
+                      options: ValidationOptions, trace: Tuple[str, ...]):
     """Validates a single message field and its children.
 
     Args:
         field: FieldDescriptor instance.
         value: The value of the current message field.
-        errors: List of text error messages.
+        output: ValidationOutput.
         raise_on_error: If True, raises a ValidationError exception when errors
             are encountered. If False, the user must manually check the return
             value to identify validation errors.
-        validate_ids: A boolean that controls whether the IDs of Reactions or
-            Datasets should be checked for validity. Defaults to False.
+        options: ValidationOptions.
         trace: Tuple containing a string "stack trace" to track the position of
             the current message relative to the recursion root.
     """
@@ -199,28 +225,29 @@ def _validate_message(field, value, errors, raise_on_error, validate_ids,
                     field.TYPE_MESSAGE:
                 for key, submessage in value.items():
                     this_trace = trace + (f'{field.name}["{key}"]',)
-                    errors.extend(
-                        validate_message(submessage,
-                                         raise_on_error=raise_on_error,
-                                         validate_ids=validate_ids,
-                                         trace=this_trace))
+                    this_output = validate_message(
+                        submessage,
+                        raise_on_error=raise_on_error,
+                        options=options,
+                        trace=this_trace)
+                    output.extend(this_output)
             else:  # value is a primitive
                 pass
         else:  # Just a repeated message
             for index, submessage in enumerate(value):
                 this_trace = trace + (f'{field.name}[{index}]',)
-                errors.extend(
-                    validate_message(submessage,
-                                     raise_on_error=raise_on_error,
-                                     validate_ids=validate_ids,
-                                     trace=this_trace))
+                this_output = validate_message(submessage,
+                                               raise_on_error=raise_on_error,
+                                               options=options,
+                                               trace=this_trace)
+                output.extend(this_output)
     else:  # no recursion needed
         this_trace = trace + (field.name,)
-        errors.extend(
-            validate_message(value,
-                             raise_on_error=raise_on_error,
-                             validate_ids=validate_ids,
-                             trace=this_trace))
+        this_output = validate_message(value,
+                                       raise_on_error=raise_on_error,
+                                       options=options,
+                                       trace=this_trace)
+        output.extend(this_output)
 
 
 class ValidationError(Warning):
@@ -232,7 +259,7 @@ class ValidationWarning(Warning):
 
 
 # pylint: disable=missing-function-docstring
-def ensure_float_nonnegative(message, field):
+def ensure_float_nonnegative(message: ord_schema.Message, field: str):
     if getattr(message, field) < 0:
         warnings.warn(
             f'Field {field} of message '
@@ -240,7 +267,10 @@ def ensure_float_nonnegative(message, field):
             ' non-negative', ValidationError)
 
 
-def ensure_float_range(message, field, min_value=-math.inf, max_value=math.inf):
+def ensure_float_range(message: ord_schema.Message,
+                       field: str,
+                       min_value: float = -math.inf,
+                       max_value: float = math.inf):
     if (getattr(message, field) < min_value or
             getattr(message, field) > max_value):
         warnings.warn(
@@ -249,7 +279,7 @@ def ensure_float_range(message, field, min_value=-math.inf, max_value=math.inf):
             f' {min_value} and {max_value}', ValidationError)
 
 
-def check_value_and_units(message):
+def check_value_and_units(message: ord_schema.UnitMessage):
     """Checks that value/units messages are complete."""
     if not message.HasField('value'):
         warnings.warn(f'{type(message)} requires `value` to be set',
@@ -259,7 +289,7 @@ def check_value_and_units(message):
                       ValidationError)
 
 
-def check_type_and_details(message):
+def check_type_and_details(message: ord_schema.TypeDetailsMessage):
     """Checks that type/details messages are complete."""
     if message.type == message.UNSPECIFIED:
         warnings.warn(f'{type(message)} requires `type` to be set',
@@ -270,23 +300,23 @@ def check_type_and_details(message):
             ValidationError)
 
 
-def reaction_has_internal_standard(message):
+def reaction_has_internal_standard(message: reaction_pb2.Reaction) -> bool:
     """Whether any reaction component uses the internal standard role."""
     for reaction_input in message.inputs.values():
         for compound in reaction_input.components:
             if (compound.reaction_role ==
-                    compound.ReactionRole.INTERNAL_STANDARD):
+                    reaction_pb2.ReactionRole.INTERNAL_STANDARD):
                 return True
-    for workup in message.workup:
+    for workup in message.workups:
         if workup.input:
             for compound in workup.input.components:
                 if (compound.reaction_role ==
-                        compound.ReactionRole.INTERNAL_STANDARD):
+                        reaction_pb2.ReactionRole.INTERNAL_STANDARD):
                     return True
     return False
 
 
-def reaction_has_limiting_component(message):
+def reaction_has_limiting_component(message: reaction_pb2.Reaction) -> bool:
     """Whether any reaction input compound is limiting."""
     for reaction_input in message.inputs.values():
         for compound in reaction_input.components:
@@ -295,16 +325,17 @@ def reaction_has_limiting_component(message):
     return False
 
 
-def reaction_needs_internal_standard(message):
+def reaction_needs_internal_standard(message: reaction_pb2.Reaction) -> bool:
     """Whether any analysis uses an internal standard."""
     for outcome in message.outcomes:
-        for analysis in outcome.analyses.values():
-            if analysis.uses_internal_standard:
-                return True
+        for product in outcome.products:
+            for measurement in product.measurements:
+                if measurement.uses_internal_standard:
+                    return True
     return False
 
 
-def get_referenced_reaction_ids(message):
+def get_referenced_reaction_ids(message: reaction_pb2.Reaction) -> Set[str]:
     """Return the set of reaction IDs that are referenced in a Reaction."""
     referenced_ids = set()
     for reaction_input in message.inputs.values():
@@ -317,8 +348,21 @@ def get_referenced_reaction_ids(message):
     return referenced_ids
 
 
-def validate_dataset(message, validate_id=False):
+def is_valid_reaction_id(reaction_id: str) -> bool:
+    match = re.fullmatch('^ord-[0-9a-f]{32}$', reaction_id)
+    return bool(match)
+
+
+def is_valid_dataset_id(dataset_id: str) -> bool:
+    match = re.fullmatch('^ord_dataset-[0-9a-f]{32}$', dataset_id)
+    return bool(match)
+
+
+def validate_dataset(message: dataset_pb2.Dataset,
+                     options: Optional[ValidationOptions] = None):
     # pylint: disable=too-many-branches,too-many-nested-blocks
+    if options is None:
+        options = ValidationOptions()
     if not message.reactions and not message.reaction_ids:
         warnings.warn('Dataset requires reactions or reaction_ids',
                       ValidationError)
@@ -327,11 +371,11 @@ def validate_dataset(message, validate_id=False):
                       ValidationError)
     if message.reaction_ids:
         for reaction_id in message.reaction_ids:
-            if not re.fullmatch('^ord-[0-9a-f]{32}$', reaction_id):
+            if not is_valid_reaction_id(reaction_id):
                 warnings.warn('Reaction ID is malformed', ValidationError)
-    if validate_id:
+    if options.validate_ids:
         # The dataset_id is a 32-character uuid4 hex string.
-        if not re.fullmatch('^ord_dataset-[0-9a-f]{32}$', message.dataset_id):
+        if not is_valid_dataset_id(message.dataset_id):
             warnings.warn('Dataset ID is malformed', ValidationError)
     # Check cross-references
     dataset_referenced_ids = set()
@@ -355,7 +399,7 @@ def validate_dataset(message, validate_id=False):
             ValidationError)
 
 
-def validate_dataset_example(message):
+def validate_dataset_example(message: dataset_pb2.DatasetExample):
     if not message.description:
         warnings.warn('DatasetExample.description is required', ValidationError)
     if not message.url:
@@ -364,13 +408,21 @@ def validate_dataset_example(message):
         warnings.warn('DatasetExample.created is required', ValidationError)
 
 
-def validate_reaction(message, validate_id=False):
-    if len(message.inputs) == 0:
-        warnings.warn('Reactions should have at least 1 reaction input',
-                      ValidationError)
-    if len(message.outcomes) == 0:
-        warnings.warn('Reactions should have at least 1 reaction outcome',
-                      ValidationError)
+def validate_reaction(message: reaction_pb2.Reaction,
+                      options: Optional[ValidationOptions] = None):
+    if options is None:
+        options = ValidationOptions()
+    if (options.allow_reaction_smiles_only and
+            message_helpers.get_reaction_smiles(message) and
+            len(message.inputs) == 0 and len(message.outcomes) == 0):
+        pass
+    else:
+        if len(message.inputs) == 0:
+            warnings.warn('Reactions should have at least 1 reaction input',
+                          ValidationError)
+        if len(message.outcomes) == 0:
+            warnings.warn('Reactions should have at least 1 reaction outcome',
+                          ValidationError)
     if (reaction_needs_internal_standard(message) and
             not reaction_has_internal_standard(message)):
         warnings.warn(
@@ -383,52 +435,86 @@ def validate_reaction(message, validate_id=False):
             'If reaction conversion is specified, at least one '
             'reaction input component must be labeled is_limiting',
             ValidationError)
-    if validate_id:
+    if options.validate_ids:
         # The reaction_id suffix is a 32-character uuid4 hex string.
         if not re.fullmatch('^ord-[0-9a-f]{32}$', message.reaction_id):
             warnings.warn('Reaction ID is malformed', ValidationError)
+    if options.require_provenance:
+        if not message.HasField('provenance'):
+            warnings.warn('Reaction requires provenance', ValidationError)
 
 
-def validate_reaction_identifier(message):
+def validate_reaction_identifier(message: reaction_pb2.ReactionIdentifier):
     check_type_and_details(message)
+    if message.type in [message.REACTION_SMILES, message.REACTION_CXSMILES]:
+        if message.type == message.REACTION_CXSMILES:
+            smiles = message.value.split()[0]
+        else:
+            smiles = message.value
+        try:
+            message_helpers.validate_reaction_smiles(smiles)
+        except ValueError as error:
+            warnings.warn(str(error), ValidationError)
     if not message.value:
         warnings.warn('value must be set', ValidationError)
 
 
-def validate_reaction_input(message):
+def validate_reaction_input(message: reaction_pb2.ReactionInput):
     if len(message.components) + len(message.crude_components) == 0:
         warnings.warn('Reaction inputs must have at least one component',
                       ValidationError)
     for component in message.components:
-        if not component.WhichOneof('amount'):
+        if not component.amount.WhichOneof('kind'):
             warnings.warn('Reaction input components require an amount',
                           ValidationError)
 
 
-def validate_addition_device(message):
+def validate_addition_device(
+        message: reaction_pb2.ReactionInput.AdditionDevice):
     check_type_and_details(message)
 
 
-def validate_addition_speed(message):
+def validate_addition_speed(message: reaction_pb2.ReactionInput.AdditionSpeed):
     del message  # Unused.
 
 
-def validate_crude_component(message):
+def validate_amount(message: reaction_pb2.Amount):
+    if (message.HasField('volume_includes_solutes') and
+            message.WhichOneof('kind') != 'volume'):
+        warnings.warn(
+            'volume_includes_solutes should only be set for volume amounts',
+            ValidationError)
+
+
+def validate_source(message: reaction_pb2.Compound.Source):
+    del message  # Unused.
+
+
+def validate_crude_component(message: reaction_pb2.CrudeComponent):
     if not message.reaction_id:
         warnings.warn('CrudeComponents must specify a reaction_id',
                       ValidationError)
-    if message.has_derived_amount and message.HasField('amount'):
+    if message.has_derived_amount and message.amount.HasField('kind'):
         warnings.warn(
             'CrudeComponents with derived amounts cannot have their'
             ' mass or volume specified explicitly', ValidationError)
     if ((not message.HasField('has_derived_amount') or
-         not message.has_derived_amount) and not message.HasField('amount')):
+         not message.has_derived_amount) and
+            not message.amount.HasField('kind')):
         warnings.warn(
             'Crude components should either have a derived amount or'
             ' a specified mass or volume', ValidationError)
+    if message.amount.WhichOneof('kind') not in [None, 'mass', 'volume']:
+        warnings.warn(
+            'Crude component amounts must be specified by mass or volume',
+            ValidationError)
+    if message.amount.HasField('volume_includes_solutes'):
+        warnings.warn(
+            'volume_includes_solutes should only be used for input Compounds',
+            ValidationError)
 
 
-def validate_compound(message):
+def validate_compound(message: reaction_pb2.Compound):
     if len(message.identifiers) == 0:
         warnings.warn('Compounds must have at least one identifier',
                       ValidationError)
@@ -443,12 +529,7 @@ def validate_compound(message):
         warnings.warn(str(error), ValidationWarning)
 
 
-def validate_compound_feature(message):
-    if not message.name:
-        warnings.warn('Compound features must have names', ValidationError)
-
-
-def validate_compound_preparation(message):
+def validate_compound_preparation(message: reaction_pb2.CompoundPreparation):
     check_type_and_details(message)
     if message.reaction_id and message.type != message.SYNTHESIZED:
         warnings.warn(
@@ -456,11 +537,11 @@ def validate_compound_preparation(message):
             ' preparations when SYNTHESIZED', ValidationError)
 
 
-def validate_compound_identifier(message):
+def validate_compound_identifier(message: reaction_pb2.CompoundIdentifier):
     check_type_and_details(message)
     if not message.value:
         warnings.warn('value must be set', ValidationError)
-    if Chem and message.type == message.SMILES:
+    if message.type == message.SMILES:
         mol = Chem.MolFromSmiles(message.value)
         if mol is None:
             warnings.warn(
@@ -480,35 +561,32 @@ def validate_compound_identifier(message):
                 ' MolBlock identifier', ValidationError)
 
 
-def validate_vessel(message):
+def validate_vessel(message: reaction_pb2.Vessel):
+    check_type_and_details(message)
+
+
+def validate_vessel_material(message: reaction_pb2.VesselMaterial):
+    check_type_and_details(message)
+
+
+def validate_vessel_attachment(message: reaction_pb2.VesselAttachment):
+    check_type_and_details(message)
+
+
+def validate_vessel_preparation(message: reaction_pb2.VesselPreparation):
+    check_type_and_details(message)
+
+
+def validate_reaction_setup(message: reaction_pb2.ReactionSetup):
     del message  # Unused.
 
 
-def validate_vessel_type(message):
+def validate_reaction_environment(
+        message: reaction_pb2.ReactionSetup.ReactionEnvironment):
     check_type_and_details(message)
 
 
-def validate_vessel_material(message):
-    check_type_and_details(message)
-
-
-def validate_vessel_attachment(message):
-    check_type_and_details(message)
-
-
-def validate_vessel_preparation(message):
-    check_type_and_details(message)
-
-
-def validate_reaction_setup(message):
-    del message  # Unused.
-
-
-def validate_reaction_environment(message):
-    check_type_and_details(message)
-
-
-def validate_reaction_conditions(message):
+def validate_reaction_conditions(message: reaction_pb2.ReactionConditions):
     if message.conditions_are_dynamic and not message.details:
         warnings.warn(
             'Reaction conditions are dynamic, but no details'
@@ -522,7 +600,8 @@ def validate_reaction_conditions(message):
             ValidationWarning)
 
 
-def validate_temperature_conditions(message):
+def validate_temperature_conditions(
+        message: reaction_pb2.TemperatureConditions):
     if not message.setpoint.value:
         warnings.warn(
             'Temperature setpoints should be specified; even if '
@@ -530,87 +609,80 @@ def validate_temperature_conditions(message):
             'the precision of your estimate.', ValidationWarning)
 
 
-def validate_temperature_control(message):
+def validate_temperature_control(
+        message: reaction_pb2.TemperatureConditions.TemperatureControl):
     check_type_and_details(message)
 
 
-def validate_temperature_measurement(message):
+def validate_temperature_measurement(
+        message: reaction_pb2.TemperatureConditions.Measurement):
     check_type_and_details(message)
 
 
-def validate_pressure_conditions(message):
+def validate_pressure_conditions(message: reaction_pb2.PressureConditions):
     del message
 
 
-def validate_pressure_control(message):
+def validate_pressure_control(
+        message: reaction_pb2.PressureConditions.PressureControl):
     check_type_and_details(message)
 
 
-def validate_atmosphere(message):
+def validate_atmosphere(message: reaction_pb2.PressureConditions.Atmosphere):
     check_type_and_details(message)
 
 
-def validate_pressure_measurement(message):
+def validate_pressure_measurement(
+        message: reaction_pb2.PressureConditions.Measurement):
     check_type_and_details(message)
 
 
-def validate_stirring_conditions(message):
-    del message  # Unused.
-
-
-def validate_stirring_method(message):
+def validate_stirring_conditions(message: reaction_pb2.StirringConditions):
     check_type_and_details(message)
 
 
-def validate_stirring_rate(message):
+def validate_stirring_rate(
+        message: reaction_pb2.StirringConditions.StirringRate):
     ensure_float_nonnegative(message, 'rpm')
 
 
-def validate_illumination_conditions(message):
-    del message  # Unused.
-
-
-def validate_illumination_type(message):
+def validate_illumination_conditions(
+        message: reaction_pb2.IlluminationConditions):
     check_type_and_details(message)
 
 
-def validate_electrochemistry_conditions(message):
-    del message  # Unused.
-
-
-def validate_electrochemistry_type(message):
+def validate_electrochemistry_conditions(
+        message: reaction_pb2.ElectrochemistryConditions):
     check_type_and_details(message)
 
 
-def validate_electrochemistry_cell(message):
+def validate_electrochemistry_cell(
+        message: reaction_pb2.ElectrochemistryConditions.ElectrochemistryCell):
     check_type_and_details(message)
 
 
-def validate_electrochemistry_measurement(message):
+def validate_electrochemistry_measurement(
+        message: reaction_pb2.ElectrochemistryConditions.Measurement):
     del message  # Unused.
 
 
-def validate_flow_conditions(message):
-    del message  # Unused.
-
-
-def validate_flow_type(message):
+def validate_flow_conditions(message: reaction_pb2.FlowConditions):
     check_type_and_details(message)
 
 
-def validate_tubing(message):
+def validate_tubing(message: reaction_pb2.FlowConditions.Tubing):
     check_type_and_details(message)
 
 
-def validate_reaction_notes(message):
+def validate_reaction_notes(message: reaction_pb2.ReactionNotes):
     del message  # Unused.
 
 
-def validate_reaction_observation(message):
+def validate_reaction_observation(message: reaction_pb2.ReactionObservation):
     del message  # Unused.
 
 
-def validate_reaction_workup(message):
+def validate_reaction_workup(message: reaction_pb2.ReactionWorkup):
     check_type_and_details(message)
     if (message.type == reaction_pb2.ReactionWorkup.WAIT and
             not message.duration.value):
@@ -643,9 +715,20 @@ def validate_reaction_workup(message):
     if (message.type == reaction_pb2.ReactionWorkup.PH_ADJUST and
             not message.HasField('target_ph')):
         warnings.warn('pH adjustment workup missing target pH', ValidationError)
+    if message.type == reaction_pb2.ReactionWorkup.ALIQUOT:
+        if not message.amount.WhichOneof('kind'):
+            warnings.warn('Aliquot workup step missing volume/mass amount',
+                          ValidationError)
+        if message.amount.WhichOneof('kind') not in ['mass', 'volume']:
+            warnings.warn('Aliquot amounts must be specified by mass or volume',
+                          ValidationError)
+        if message.amount.HasField('volume_includes_solutes'):
+            warnings.warn(
+                'volume_includes_solutes should only '
+                'be used for input Compounds', ValidationError)
 
 
-def validate_reaction_outcome(message):
+def validate_reaction_outcome(message: reaction_pb2.ReactionOutcome):
     # pylint: disable=singleton-comparison
     # Can only have one desired product
     if sum(product.is_desired_product for product in message.products) > 1:
@@ -655,15 +738,12 @@ def validate_reaction_outcome(message):
     # NOTE(ccoley): Could use any(), but using expanded loops for clarity
     analysis_keys = list(message.analyses.keys())
     for product in message.products:
-        for field in [
-                'analysis_identity', 'analysis_yield', 'analysis_purity',
-                'analysis_selectivity'
-        ]:
-            for key in getattr(product, field):
-                if key not in analysis_keys:
-                    warnings.warn(
-                        f'Undefined analysis key {key} '
-                        'in ReactionProduct', ValidationError)
+        for measurement in product.measurements:
+            if (measurement.analysis_key and
+                    measurement.analysis_key not in analysis_keys):
+                warnings.warn(
+                    f'analysis key {measurement.analysis_key} does not match '
+                    f'any known analysis ({analysis_keys})', ValidationError)
     # TODO(ccoley): While we do not currently check whether the parent Reaction
     # is *actually* used in a multistep reaction within a Dataset (i.e., in a
     # CrudeComponent); this is an additional check that could be added to the
@@ -675,35 +755,71 @@ def validate_reaction_outcome(message):
             ValidationWarning)
 
 
-def validate_reaction_product(message):
-    # pylint: disable=too-many-boolean-expressions
-    if (message.compound.HasField('volume_includes_solutes') or
-            message.compound.HasField('is_limiting') or
-            message.compound.preparations or message.compound.vendor_source or
-            message.compound.vendor_id or message.compound.vendor_lot):
+def validate_product_compound(message: reaction_pb2.ProductCompound):
+    if len(message.identifiers) == 0:
+        warnings.warn('Compounds must have at least one identifier',
+                      ValidationError)
+    if all(identifier.type == identifier.NAME
+           for identifier in message.identifiers):
         warnings.warn(
-            'Compounds defined as reaction products should not have'
-            ' any inapplicable fields defined.', ValidationError)
+            'Compounds should have more specific identifiers than '
+            'NAME whenever possible', ValidationWarning)
+    try:
+        message_helpers.check_compound_identifiers(message)
+    except ValueError as error:
+        warnings.warn(str(error), ValidationWarning)
 
 
-def validate_texture(message):
+def validate_texture(message: reaction_pb2.ProductCompound.Texture):
     check_type_and_details(message)
 
 
-def validate_selectivity(message):
-    ensure_float_nonnegative(message, 'precision')
-    if message.type == message.EE:
-        ensure_float_range(message, 'value', 0, 100)
-        if 0 < message.value < 1:
+def validate_product_measurement(message: reaction_pb2.ProductMeasurement):
+    check_type_and_details(message)
+    if not message.analysis_key:
+        warnings.warn(
+            'Product measurements should be associated with an'
+            ' analysis through its analysis_key', ValidationWarning)
+    if message.type == reaction_pb2.ProductMeasurement.IDENTITY:
+        if message.WhichOneof('value'):
             warnings.warn(
-                'EE selectivity values are 0-100, not fractions '
-                f'({message.value} used)', ValidationWarning)
-    elif message.type in [message.ER, message.DR, message.EZ, message.ZE]:
-        ensure_float_nonnegative(message, 'value')
+                'Product measurements to confirm identities should'
+                ' not have any values defined', ValidationError)
+    elif message.type == reaction_pb2.ProductMeasurement.YIELD:
+        if message.WhichOneof('value') != 'percentage':
+            warnings.warn(
+                'Yield measurements should be defined as percentage'
+                ' values', ValidationError)
+    elif message.type == reaction_pb2.ProductMeasurement.PURITY:
+        if message.WhichOneof('value') != 'percentage':
+            warnings.warn(
+                'Purity measurements should be defined as percentage'
+                ' values', ValidationError)
+    elif message.type in (reaction_pb2.ProductMeasurement.AREA,
+                          reaction_pb2.ProductMeasurement.COUNTS,
+                          reaction_pb2.ProductMeasurement.INTENSITY):
+        if message.WhichOneof('value') not in ('percentage', 'float_value'):
+            warnings.warn(
+                'Product measurements of type AREA, COUNTS, or '
+                'INTENSITY must use numeric values (percentage or float_value)',
+                ValidationError)
+    if message.HasField('selectivity') and (
+            message.type != reaction_pb2.ProductMeasurement.SELECTIVITY):
+        warnings.warn(
+            'The selectivity_type field should only be used for a'
+            ' product measurement with type SELECTIVITY', ValidationError)
+
+
+def validate_selectivity(message: reaction_pb2.ProductMeasurement.Selectivity):
     check_type_and_details(message)
 
 
-def validate_date_time(message):
+def validate_mass_spec_measurement_type(
+        message: reaction_pb2.ProductMeasurement.MassSpecMeasurementDetails):
+    check_type_and_details(message)
+
+
+def validate_date_time(message: reaction_pb2.DateTime):
     if message.value:
         try:
             parser.parse(message.value).ctime()
@@ -712,12 +828,12 @@ def validate_date_time(message):
                           ValidationError)
 
 
-def validate_reaction_analysis(message):
+def validate_analysis(message: reaction_pb2.Analysis):
     # TODO(ccoley): Will be lots to expand here if we add structured data.
     check_type_and_details(message)
 
 
-def validate_reaction_provenance(message):
+def validate_reaction_provenance(message: reaction_pb2.ReactionProvenance):
     # Prepare datetimes
     if not message.HasField('record_created'):
         warnings.warn('Reactions must have record_created defined',
@@ -744,10 +860,23 @@ def validate_reaction_provenance(message):
         if (record_modified - record_created).total_seconds() < 0:
             warnings.warn('Record modified time should be after creation',
                           ValidationError)
+    if not message.record_created.person.email:
+        warnings.warn('User email is required for record_created',
+                      ValidationError)
+    for record in message.record_modified:
+        if not record.person.email:
+            warnings.warn('User email is required for record_modified',
+                          ValidationError)
+    if message.doi:
+        parsed_doi = message_helpers.parse_doi(message.doi)
+        if message.doi != parsed_doi:
+            warnings.warn(
+                f'DOI should be trimmed ({message.doi} -> {parsed_doi})',
+                ValidationError)
     # TODO(ccoley) could check if publication_url is valid, etc.
 
 
-def validate_record_event(message):
+def validate_record_event(message: reaction_pb2.RecordEvent):
     if not message.time.value:
         warnings.warn('RecordEvent must have `time` specified', ValidationError)
     person = message.person
@@ -759,7 +888,7 @@ def validate_record_event(message):
         warnings.warn('Person must have `email` specified', ValidationError)
 
 
-def validate_person(message):
+def validate_person(message: reaction_pb2.Person):
     # NOTE(ccoley): final character is checksum, but ignoring that for now
     if message.orcid:
         if not re.match('[0-9]{4}-[0-9]{4}-[0-9]{4}-[0-9]{3}[0-9X]',
@@ -776,43 +905,43 @@ def validate_person(message):
                           ValidationError)
 
 
-def validate_time(message):
+def validate_time(message: reaction_pb2.Time):
     check_value_and_units(message)
     ensure_float_nonnegative(message, 'value')
     ensure_float_nonnegative(message, 'precision')
 
 
-def validate_mass(message):
+def validate_mass(message: reaction_pb2.Mass):
     check_value_and_units(message)
     ensure_float_nonnegative(message, 'value')
     ensure_float_nonnegative(message, 'precision')
 
 
-def validate_moles(message):
+def validate_moles(message: reaction_pb2.Moles):
     check_value_and_units(message)
     ensure_float_nonnegative(message, 'value')
     ensure_float_nonnegative(message, 'precision')
 
 
-def validate_volume(message):
+def validate_volume(message: reaction_pb2.Volume):
     check_value_and_units(message)
     ensure_float_nonnegative(message, 'value')
     ensure_float_nonnegative(message, 'precision')
 
 
-def validate_concentration(message):
+def validate_concentration(message: reaction_pb2.Concentration):
     check_value_and_units(message)
     ensure_float_nonnegative(message, 'value')
     ensure_float_nonnegative(message, 'precision')
 
 
-def validate_pressure(message):
+def validate_pressure(message: reaction_pb2.Pressure):
     check_value_and_units(message)
     ensure_float_nonnegative(message, 'value')
     ensure_float_nonnegative(message, 'precision')
 
 
-def validate_temperature(message):
+def validate_temperature(message: reaction_pb2.Temperature):
     check_value_and_units(message)
     if message.units == message.CELSIUS:
         ensure_float_range(message, 'value', min_value=-273.15)
@@ -823,47 +952,57 @@ def validate_temperature(message):
     ensure_float_nonnegative(message, 'precision')
 
 
-def validate_current(message):
+def validate_current(message: reaction_pb2.Current):
     check_value_and_units(message)
     ensure_float_nonnegative(message, 'value')
     ensure_float_nonnegative(message, 'precision')
 
 
-def validate_voltage(message):
+def validate_voltage(message: reaction_pb2.Voltage):
     check_value_and_units(message)
     ensure_float_nonnegative(message, 'value')
     ensure_float_nonnegative(message, 'precision')
 
 
-def validate_length(message):
+def validate_length(message: reaction_pb2.Length):
     check_value_and_units(message)
     ensure_float_nonnegative(message, 'value')
     ensure_float_nonnegative(message, 'precision')
 
 
-def validate_wavelength(message):
+def validate_wavelength(message: reaction_pb2.Wavelength):
     check_value_and_units(message)
     ensure_float_nonnegative(message, 'value')
     ensure_float_nonnegative(message, 'precision')
 
 
-def validate_flow_rate(message):
+def validate_flow_rate(message: reaction_pb2.FlowRate):
     check_value_and_units(message)
     ensure_float_nonnegative(message, 'value')
     ensure_float_nonnegative(message, 'precision')
 
 
-def validate_percentage(message):
+def validate_percentage(message: reaction_pb2.Percentage):
+    if not message.HasField('value'):
+        warnings.warn(f'{type(message)} requires `value` to be set',
+                      ValidationError)
     if 0 < message.value < 1:
         warnings.warn(
             'Percentage values are 0-100, not fractions '
             f'({message.value} used)', ValidationWarning)
+    if message.value < 0 or message.value > 100:
+        warnings.warn(
+            f'Percentage value ({message.value}) is outside the expected'
+            'range (0-100)', ValidationWarning)
+    ensure_float_nonnegative(message, 'precision')
+
+
+def validate_float_value(message: ord_schema.Message):
     ensure_float_nonnegative(message, 'value')
     ensure_float_nonnegative(message, 'precision')
-    ensure_float_range(message, 'value', 0, 105)  # generous upper bound
 
 
-def validate_data(message):
+def validate_data(message: reaction_pb2.Data):
     # TODO(kearnes): Validate/ping URLs?
     if not message.WhichOneof('kind'):
         warnings.warn('Data requires one of {value, bytes_value, url}',
@@ -891,21 +1030,21 @@ _VALIDATOR_SWITCH = {
     reaction_pb2.ReactionInput.AdditionSpeed:
         validate_addition_speed,
     # Compounds
+    reaction_pb2.Amount:
+        validate_amount,
     reaction_pb2.CrudeComponent:
         validate_crude_component,
     reaction_pb2.Compound:
         validate_compound,
-    reaction_pb2.Compound.Feature:
-        validate_compound_feature,
     reaction_pb2.CompoundPreparation:
         validate_compound_preparation,
     reaction_pb2.CompoundIdentifier:
         validate_compound_identifier,
+    reaction_pb2.Compound.Source:
+        validate_source,
     # Setup
     reaction_pb2.Vessel:
         validate_vessel,
-    reaction_pb2.VesselType:
-        validate_vessel_type,
     reaction_pb2.VesselMaterial:
         validate_vessel_material,
     reaction_pb2.VesselAttachment:
@@ -935,26 +1074,18 @@ _VALIDATOR_SWITCH = {
         validate_pressure_measurement,
     reaction_pb2.StirringConditions:
         validate_stirring_conditions,
-    reaction_pb2.StirringConditions.StirringMethod:
-        validate_stirring_method,
     reaction_pb2.StirringConditions.StirringRate:
         validate_stirring_rate,
     reaction_pb2.IlluminationConditions:
         validate_illumination_conditions,
-    reaction_pb2.IlluminationConditions.IlluminationType:
-        validate_illumination_type,
     reaction_pb2.ElectrochemistryConditions:
         validate_electrochemistry_conditions,
-    reaction_pb2.ElectrochemistryConditions.ElectrochemistryType:
-        validate_electrochemistry_type,
     reaction_pb2.ElectrochemistryConditions.ElectrochemistryCell:
         validate_electrochemistry_cell,
     reaction_pb2.ElectrochemistryConditions.Measurement:
         validate_electrochemistry_measurement,
     reaction_pb2.FlowConditions:
         validate_flow_conditions,
-    reaction_pb2.FlowConditions.FlowType:
-        validate_flow_type,
     reaction_pb2.FlowConditions.Tubing:
         validate_tubing,
     # Annotations
@@ -967,16 +1098,20 @@ _VALIDATOR_SWITCH = {
         validate_reaction_workup,
     reaction_pb2.ReactionOutcome:
         validate_reaction_outcome,
-    reaction_pb2.ReactionProduct:
-        validate_reaction_product,
-    reaction_pb2.ReactionProduct.Texture:
+    reaction_pb2.ProductCompound:
+        validate_product_compound,
+    reaction_pb2.ProductCompound.Texture:
         validate_texture,
-    reaction_pb2.Selectivity:
+    reaction_pb2.ProductMeasurement:
+        validate_product_measurement,
+    reaction_pb2.ProductMeasurement.Selectivity:
         validate_selectivity,
+    reaction_pb2.ProductMeasurement.MassSpecMeasurementDetails:
+        validate_mass_spec_measurement_type,
     reaction_pb2.DateTime:
         validate_date_time,
-    reaction_pb2.ReactionAnalysis:
-        validate_reaction_analysis,
+    reaction_pb2.Analysis:
+        validate_analysis,
     # Metadata
     reaction_pb2.ReactionProvenance:
         validate_reaction_provenance,
@@ -1011,6 +1146,8 @@ _VALIDATOR_SWITCH = {
         validate_flow_rate,
     reaction_pb2.Percentage:
         validate_percentage,
+    reaction_pb2.FloatValue:
+        validate_float_value,
     reaction_pb2.Data:
         validate_data,
 }

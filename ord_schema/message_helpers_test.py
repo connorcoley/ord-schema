@@ -15,12 +15,14 @@
 
 import os
 import tempfile
+import time
 
 from absl import flags
 from absl.testing import absltest
 from absl.testing import parameterized
 from google.protobuf import json_format
 from google.protobuf import text_format
+import pandas as pd
 from rdkit import Chem
 
 from ord_schema import message_helpers
@@ -56,6 +58,8 @@ _BENZENE_MOLBLOCK = """241
   5 11  1  0  0  0  0
   6 12  1  0  0  0  0
 M  END"""
+
+# pylint: disable=no-self-use
 
 
 class MessageHelpersTest(parameterized.TestCase, absltest.TestCase):
@@ -101,6 +105,12 @@ class MessageHelpersTest(parameterized.TestCase, absltest.TestCase):
                                     'invalid structural identifier'):
             message_helpers.mol_from_compound(compound)
 
+    def test_get_product_yield(self):
+        product = reaction_pb2.ProductCompound()
+        self.assertIsNone(message_helpers.get_product_yield(product))
+        product.measurements.add(type='YIELD', percentage=dict(value=23))
+        self.assertEqual(23, message_helpers.get_product_yield(product))
+
     def test_check_compound_identifiers(self):
         compound = reaction_pb2.Compound()
         compound.identifiers.add(value='c1ccccc1', type='SMILES')
@@ -119,17 +129,22 @@ class MessageHelpersTest(parameterized.TestCase, absltest.TestCase):
             value='c1ccccc1', type='SMILES')
         reactant1.components.add(reaction_role='SOLVENT').identifiers.add(
             value='N', type='SMILES')
-        self.assertEqual(message_helpers.get_reaction_smiles(reaction),
-                         'c1ccccc1>N>')
+        self.assertEqual(
+            message_helpers.get_reaction_smiles(reaction,
+                                                generate_if_missing=True),
+            'c1ccccc1>N>')
         reactant2 = reaction.inputs['reactant2']
         reactant2.components.add(reaction_role='REACTANT').identifiers.add(
             value='Cc1ccccc1', type='SMILES')
         reactant2.components.add(reaction_role='SOLVENT').identifiers.add(
             value='N', type='SMILES')
-        reaction.outcomes.add().products.add().compound.identifiers.add(
-            value='O=C=O', type='SMILES')
-        self.assertEqual(message_helpers.get_reaction_smiles(reaction),
-                         'Cc1ccccc1.c1ccccc1>N>O=C=O')
+        reaction.outcomes.add().products.add(
+            reaction_role='PRODUCT').identifiers.add(value='O=C=O',
+                                                     type='SMILES')
+        self.assertEqual(
+            message_helpers.get_reaction_smiles(reaction,
+                                                generate_if_missing=True),
+            'Cc1ccccc1.c1ccccc1>N>O=C=O')
 
     def test_get_reaction_smiles_failure(self):
         reaction = reaction_pb2.Reaction()
@@ -138,16 +153,50 @@ class MessageHelpersTest(parameterized.TestCase, absltest.TestCase):
         component.identifiers.add(value='benzene', type='NAME')
         with self.assertRaisesRegex(ValueError,
                                     'no valid reactants or products'):
-            message_helpers.get_reaction_smiles(reaction)
+            message_helpers.get_reaction_smiles(reaction,
+                                                generate_if_missing=True)
         component.identifiers.add(value='c1ccccc1', type='SMILES')
         with self.assertRaisesRegex(ValueError, 'must contain at least one'):
             message_helpers.get_reaction_smiles(reaction,
+                                                generate_if_missing=True,
                                                 allow_incomplete=False)
-        reaction.outcomes.add().products.add().compound.identifiers.add(
-            value='invalid', type='SMILES')
-        with self.assertRaisesRegex(ValueError, 'reaction contains errors'):
+        reaction.outcomes.add().products.add(
+            reaction_role='PRODUCT').identifiers.add(value='invalid',
+                                                     type='SMILES')
+        with self.assertRaisesRegex(ValueError, 'bad reaction SMILES'):
             message_helpers.get_reaction_smiles(reaction,
+                                                generate_if_missing=True,
                                                 allow_incomplete=False)
+
+    def test_reaction_from_smiles(self):
+        reaction_smiles = '[C:1].N>O>F.Cl'
+        expected = reaction_pb2.Reaction()
+        expected.identifiers.add(value=reaction_smiles, type='REACTION_SMILES')
+        this_input = expected.inputs['from_reaction_smiles']
+        c_component = this_input.components.add()
+        c_component.identifiers.add(value='C', type='SMILES')
+        c_component.reaction_role = reaction_pb2.ReactionRole.REACTANT
+        n_component = this_input.components.add()
+        n_component.identifiers.add(value='N', type='SMILES')
+        n_component.reaction_role = reaction_pb2.ReactionRole.REACTANT
+        o_component = this_input.components.add()
+        o_component.identifiers.add(value='O', type='SMILES')
+        o_component.reaction_role = reaction_pb2.ReactionRole.REAGENT
+        outcome = expected.outcomes.add()
+        f_component = outcome.products.add()
+        f_component.identifiers.add(value='F', type='SMILES')
+        f_component.reaction_role = reaction_pb2.ReactionRole.PRODUCT
+        cl_component = outcome.products.add()
+        cl_component.identifiers.add(value='Cl', type='SMILES')
+        cl_component.reaction_role = reaction_pb2.ReactionRole.PRODUCT
+        self.assertEqual(message_helpers.reaction_from_smiles(reaction_smiles),
+                         expected)
+
+    @parameterized.named_parameters(
+        ('url', 'https://dx.doi.org/10.1021/acscatal.0c02247',
+         '10.1021/acscatal.0c02247'),)
+    def test_parse_doi(self, doi, expected):
+        self.assertEqual(message_helpers.parse_doi(doi), expected)
 
 
 class FindSubmessagesTest(absltest.TestCase):
@@ -236,8 +285,9 @@ class BuildCompoundTest(parameterized.TestCase, absltest.TestCase):
     )
     def test_amount(self, amount, expected):
         compound = message_helpers.build_compound(amount=amount)
-        self.assertEqual(getattr(compound, compound.WhichOneof('amount')),
-                         expected)
+        self.assertEqual(
+            getattr(compound.amount, compound.amount.WhichOneof('kind')),
+            expected)
 
     @parameterized.named_parameters(('missing_units', '1.2'),
                                     ('negative_mass', '-3.4 g'))
@@ -248,7 +298,7 @@ class BuildCompoundTest(parameterized.TestCase, absltest.TestCase):
     def test_role(self):
         compound = message_helpers.build_compound(role='solvent')
         self.assertEqual(compound.reaction_role,
-                         reaction_pb2.Compound.ReactionRole.SOLVENT)
+                         reaction_pb2.ReactionRole.SOLVENT)
 
     def test_bad_role(self):
         with self.assertRaisesRegex(KeyError, 'not a supported type'):
@@ -291,7 +341,7 @@ class BuildCompoundTest(parameterized.TestCase, absltest.TestCase):
 
     def test_vendor(self):
         self.assertEqual(
-            message_helpers.build_compound(vendor='Sally').vendor_source,
+            message_helpers.build_compound(vendor='Sally').source.vendor,
             'Sally')
 
 
@@ -313,35 +363,98 @@ class SetSoluteMolesTest(parameterized.TestCase, absltest.TestCase):
         solvent2 = message_helpers.build_compound(name='Solvent',
                                                   amount='100 mL')
         message_helpers.set_solute_moles(solute, [solvent2], '1 molar')
-        self.assertEqual(solute.moles,
+        self.assertEqual(solute.amount.moles,
                          reaction_pb2.Moles(units='MILLIMOLE', value=100))
         solvent3 = message_helpers.build_compound(name='Solvent',
                                                   amount='75 uL')
         message_helpers.set_solute_moles(solute, [solvent3],
                                          '3 mM',
                                          overwrite=True)
-        self.assertEqual(solute.moles,
+        self.assertEqual(solute.amount.moles,
                          reaction_pb2.Moles(units='NANOMOLE', value=225))
         solvent4 = message_helpers.build_compound(name='Solvent',
                                                   amount='0.2 uL')
         message_helpers.set_solute_moles(solute, [solvent4],
                                          '30 mM',
                                          overwrite=True)
-        self.assertEqual(solute.moles,
+        self.assertEqual(solute.amount.moles,
                          reaction_pb2.Moles(units='NANOMOLE', value=6))
         solvent5 = message_helpers.build_compound(name='Solvent',
                                                   amount='0.8 uL')
         message_helpers.set_solute_moles(solute, [solvent4, solvent5],
                                          '30 mM',
                                          overwrite=True)
-        self.assertEqual(solute.moles,
+        self.assertEqual(solute.amount.moles,
                          reaction_pb2.Moles(units='NANOMOLE', value=30))
+
+
+class CompoundIdentifiersTest(absltest.TestCase):
+
+    def test_identifier_setters(self):
+        compound = reaction_pb2.Compound()
+        identifier = message_helpers.set_compound_name(compound, 'water')
+        self.assertEqual(
+            identifier,
+            reaction_pb2.CompoundIdentifier(type='NAME', value='water'))
+        self.assertEqual(
+            compound.identifiers[0],
+            reaction_pb2.CompoundIdentifier(type='NAME', value='water'))
+        message_helpers.set_compound_smiles(compound, 'O')
+        self.assertEqual(
+            compound.identifiers[1],
+            reaction_pb2.CompoundIdentifier(type='SMILES', value='O'))
+        identifier = message_helpers.set_compound_name(compound, 'ice')
+        self.assertEqual(
+            identifier, reaction_pb2.CompoundIdentifier(type='NAME',
+                                                        value='ice'))
+        self.assertEqual(
+            compound.identifiers[0],
+            reaction_pb2.CompoundIdentifier(type='NAME', value='ice'))
+        compound = reaction_pb2.Compound()
+        identifier = message_helpers.set_compound_molblock(
+            compound, _BENZENE_MOLBLOCK)
+        self.assertEqual(_BENZENE_MOLBLOCK, compound.identifiers[0].value)
+
+    def test_identifier_getters(self):
+        compound = reaction_pb2.Compound()
+        compound.identifiers.add(type='NAME', value='water')
+        self.assertEqual(message_helpers.get_compound_name(compound), 'water')
+        self.assertIsNone(message_helpers.get_compound_smiles(compound))
+        compound.identifiers.add(type='SMILES', value='O')
+        self.assertEqual(message_helpers.get_compound_smiles(compound), 'O')
+        self.assertEqual(message_helpers.smiles_from_compound(compound), 'O')
+        compound = reaction_pb2.Compound()
+        compound.identifiers.add(type='MOLBLOCK', value=_BENZENE_MOLBLOCK)
+        self.assertEqual(message_helpers.get_compound_molblock(compound),
+                         _BENZENE_MOLBLOCK)
+        self.assertEqual(message_helpers.molblock_from_compound(compound),
+                         _BENZENE_MOLBLOCK)
+
+
+class SetDativeBondsTest(parameterized.TestCase, absltest.TestCase):
+
+    def test_has_transition_metal(self):
+        self.assertFalse(
+            message_helpers.has_transition_metal(Chem.MolFromSmiles('P')))
+        self.assertTrue(
+            message_helpers.has_transition_metal(
+                Chem.MolFromSmiles('Cl[Pd]Cl')))
+
+    @parameterized.named_parameters(
+        ('Pd(PH3)(NH3)Cl2', '[PH3][Pd](Cl)(Cl)[NH3]', ('N', 'P'),
+         'N->[Pd](<-P)(Cl)Cl'))
+    def test_set_dative_bonds(self, smiles, from_atoms, expected):
+        mol = Chem.MolFromSmiles(smiles, sanitize=False)
+        dative_mol = message_helpers.set_dative_bonds(mol,
+                                                      from_atoms=from_atoms)
+        self.assertEqual(Chem.MolToSmiles(dative_mol), expected)
 
 
 class LoadAndWriteMessageTest(parameterized.TestCase, absltest.TestCase):
 
     def setUp(self):
         super().setUp()
+        self.test_directory = self.create_tempdir()
         self.messages = [
             test_pb2.Scalar(int32_value=3, float_value=4.5),
             test_pb2.RepeatedScalar(values=[1.2, 3.4]),
@@ -350,15 +463,27 @@ class LoadAndWriteMessageTest(parameterized.TestCase, absltest.TestCase):
             test_pb2.Nested(child=test_pb2.Nested.Child(value=1.2)),
         ]
 
-    @parameterized.parameters(message_helpers.MessageFormat)
-    def test_round_trip(self, message_format):
+    @parameterized.parameters('.pbtxt', '.pb', '.json', '.pbtxt.gz', '.pb.gz',
+                              '.json.gz')
+    def test_round_trip(self, suffix):
         for message in self.messages:
-            with tempfile.NamedTemporaryFile(suffix=message_format.value) as f:
+            with tempfile.NamedTemporaryFile(suffix=suffix) as f:
                 message_helpers.write_message(message, f.name)
                 f.flush()
                 self.assertEqual(
                     message,
                     message_helpers.load_message(f.name, type(message)))
+
+    def test_gzip_reproducibility(self):
+        filename = os.path.join(self.test_directory, 'test.pb.gz')
+        for message in self.messages:
+            message_helpers.write_message(message, filename)
+            with open(filename, 'rb') as f:
+                value = f.read()
+            time.sleep(1)
+            message_helpers.write_message(message, filename)
+            with open(filename, 'rb') as f:
+                self.assertEqual(f.read(), value)
 
     def test_bad_binary(self):
         with tempfile.NamedTemporaryFile(suffix='.pb') as f:
@@ -409,6 +534,106 @@ class CreateMessageTest(parameterized.TestCase, absltest.TestCase):
     def test_invalid_messages(self, message_name):
         with self.assertRaisesRegex(ValueError, 'Cannot resolve'):
             message_helpers.create_message(message_name)
+
+
+class MessagesToDataFrameTest(parameterized.TestCase, absltest.TestCase):
+
+    @parameterized.named_parameters(
+        ('scalar', test_pb2.Scalar(int32_value=3, float_value=4.5), {
+            'int32_value': 3,
+            'float_value': 4.5
+        }),
+        ('scalar_optional',
+         test_pb2.Scalar(int32_value=0, float_value=0.0, bool_value=False), {
+             'float_value': 0.0,
+             'bool_value': False
+         }),
+        ('repeated_scalar', test_pb2.RepeatedScalar(values=[1.2, 3.4]), {
+            'values[0]': 1.2,
+            'values[1]': 3.4
+        }),
+        ('enum', test_pb2.Enum(value='FIRST'), {
+            'value': 'FIRST'
+        }),
+        ('repeated_enum', test_pb2.RepeatedEnum(values=['FIRST', 'SECOND']), {
+            'values[0]': 'FIRST',
+            'values[1]': 'SECOND'
+        }),
+        ('nested', test_pb2.Nested(child=test_pb2.Nested.Child(value=1.2)), {
+            'child.value': 1.2
+        }),
+        ('repeated_nested',
+         test_pb2.RepeatedNested(children=[
+             test_pb2.RepeatedNested.Child(value=1.2),
+             test_pb2.RepeatedNested.Child(value=3.4)
+         ]), {
+             'children[0].value': 1.2,
+             'children[1].value': 3.4
+         }),
+        ('map', test_pb2.Map(values={
+            'a': 1.2,
+            'b': 3.4
+        }), {
+            'values["a"]': 1.2,
+            'values["b"]': 3.4
+        }),
+        ('map_nested',
+         test_pb2.MapNested(
+             children={
+                 'a': test_pb2.MapNested.Child(value=1.2),
+                 'b': test_pb2.MapNested.Child(value=3.4)
+             }), {
+                 'children["a"].value': 1.2,
+                 'children["b"].value': 3.4
+             }),
+    )
+    def test_message_to_row(self, message, expected):
+        row = message_helpers.message_to_row(message)
+        pd.testing.assert_frame_equal(pd.DataFrame([row]),
+                                      pd.DataFrame([expected]),
+                                      check_like=True)
+
+    def test_messages_to_dataframe(self):
+        reaction1 = reaction_pb2.Reaction()
+        input_test = reaction1.inputs['test']
+        outcome = reaction1.outcomes.add()
+        component = input_test.components.add()
+        component.identifiers.add(type='SMILES', value='CCO')
+        component.is_limiting = True
+        component.amount.mass.value = 1.2
+        component.amount.mass.units = reaction_pb2.Mass.GRAM
+        outcome.conversion.value = 3.4
+        outcome.conversion.precision = 5.6
+        reaction2 = reaction_pb2.Reaction()
+        input_test = reaction2.inputs['test']
+        outcome = reaction2.outcomes.add()
+        component = input_test.components.add()
+        component.identifiers.add(type='SMILES', value='CCC')
+        component.is_limiting = False
+        component.amount.mass.value = 7.8
+        component.amount.mass.units = reaction_pb2.Mass.GRAM
+        outcome.conversion.value = 9.1
+        outcome.conversion.precision = 2.3
+        expected = pd.DataFrame({
+            'inputs["test"].components[0].identifiers[0].type': 'SMILES',
+            'inputs["test"].components[0].identifiers[0].value': ['CCO', 'CCC'],
+            'inputs["test"].components[0].is_limiting': [True, False],
+            'inputs["test"].components[0].amount.mass.value': [1.2, 7.8],
+            'inputs["test"].components[0].amount.mass.units': 'GRAM',
+            'outcomes[0].conversion.value': [3.4, 9.1],
+            'outcomes[0].conversion.precision': [5.6, 2.3]
+        })
+        pd.testing.assert_frame_equal(message_helpers.messages_to_dataframe(
+            [reaction1, reaction2]),
+                                      expected,
+                                      check_like=True)
+        # Drop constant columns and test again with drop_constant_columns=True.
+        del expected['inputs["test"].components[0].identifiers[0].type']
+        del expected['inputs["test"].components[0].amount.mass.units']
+        pd.testing.assert_frame_equal(message_helpers.messages_to_dataframe(
+            [reaction1, reaction2], drop_constant_columns=True),
+                                      expected,
+                                      check_like=True)
 
 
 if __name__ == '__main__':

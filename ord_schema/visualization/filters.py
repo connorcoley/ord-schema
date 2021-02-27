@@ -18,18 +18,23 @@ in this module do not include any HTML tags, only their contents.
 """
 
 import collections
+import datetime
+from typing import Any, Iterable, List, Mapping, Optional, Tuple
 
 from ord_schema import units
 from ord_schema import message_helpers
 from ord_schema.visualization import drawing
+from ord_schema.proto import reaction_pb2
 
 
-def _is_true(boolean):
+def _is_true(boolean: Any) -> bool:
     """Returns whether a value is True."""
     return bool(boolean)
 
 
-def _count_addition_order(inputs):
+def _count_addition_order(
+    inputs: Mapping[str,
+                    reaction_pb2.ReactionInput]) -> Iterable[Tuple[int, int]]:
     """Returns the number of inputs for each addition_order value.
 
     Args:
@@ -46,7 +51,9 @@ def _count_addition_order(inputs):
         yield order, counts[order]
 
 
-def _sort_addition_order(inputs):
+def _sort_addition_order(
+    inputs: Mapping[str, reaction_pb2.ReactionInput]
+) -> Iterable[Tuple[str, reaction_pb2.ReactionInput]]:
     """Sorts inputs by addition order, sorting again within stages/steps.
 
     Args:
@@ -65,7 +72,9 @@ def _sort_addition_order(inputs):
             yield key, value
 
 
-def _get_input_borders(components):
+def _get_input_borders(
+    components: List[reaction_pb2.Compound]
+) -> Iterable[Tuple[reaction_pb2.Compound, str]]:
     """Returns the CSS class for a Compound cell.
 
     The HTML representation of a Reaction groups Compounds by their parent
@@ -91,7 +100,7 @@ def _get_input_borders(components):
         yield component, border
 
 
-def _stirring_conditions(stirring):
+def _stirring_conditions(stirring: reaction_pb2.StirringConditions) -> str:
     """Generates a text description of stirring conditions.
 
     Args:
@@ -100,7 +109,7 @@ def _stirring_conditions(stirring):
     Returns:
         String description of the stirring conditions.
     """
-    if stirring.method.type == stirring.method.NONE:
+    if stirring.type == stirring.NONE:
         return 'No stirring was used.'
     txt = ''
     txt += {
@@ -111,21 +120,21 @@ def _stirring_conditions(stirring):
     }[stirring.rate.type]
     if stirring.rate.rpm:
         txt += f' ({stirring.rate.rpm} rpm)'
-    if stirring.method.type != stirring.method.UNSPECIFIED:
+    if stirring.type != stirring.UNSPECIFIED:
         txt += ' using '
         txt += {
-            stirring.method.CUSTOM: 'a custom setup',
-            stirring.method.STIR_BAR: 'a stir bar',
-            stirring.method.OVERHEAD_MIXER: 'an overhead mixer',
-            stirring.method.AGITATION: 'external agitation',
-        }[stirring.method.type]
-        txt += f' {_parenthetical_if_def(stirring.method.details)}'
+            stirring.CUSTOM: 'a custom setup',
+            stirring.STIR_BAR: 'a stir bar',
+            stirring.OVERHEAD_MIXER: 'an overhead mixer',
+            stirring.AGITATION: 'external agitation',
+        }[stirring.type]
+        txt += f' {_parenthetical_if_def(stirring.details)}'
     if txt.strip():
         txt = 'The reaction mixture was stirred ' + txt + '.'
     return txt
 
 
-def _stirring_conditions_html(stirring):
+def _stirring_conditions_html(stirring: reaction_pb2.StirringConditions) -> str:
     """Generates an HTML-ready description of stirring conditions.
 
     Args:
@@ -134,22 +143,22 @@ def _stirring_conditions_html(stirring):
     Returns:
         String description of the stirring conditions.
     """
-    if stirring.method.type == stirring.method.NONE:
+    if stirring.type == stirring.NONE:
         return ''
     txt = ''
-    if stirring.method.type != stirring.method.UNSPECIFIED:
+    if stirring.type != stirring.UNSPECIFIED:
         txt += {
-            stirring.method.CUSTOM: stirring.method.details,
-            stirring.method.STIR_BAR: 'stir bar',
-            stirring.method.OVERHEAD_MIXER: 'overhead mixer',
-            stirring.method.AGITATION: 'agitation',
-        }[stirring.method.type]
+            stirring.CUSTOM: stirring.details,
+            stirring.STIR_BAR: 'stir bar',
+            stirring.OVERHEAD_MIXER: 'overhead mixer',
+            stirring.AGITATION: 'agitation',
+        }[stirring.type]
     if stirring.rate.rpm:
         txt += f' ({stirring.rate.rpm} rpm)'
     return txt
 
 
-def _pressure_conditions(pressure):
+def _pressure_conditions(pressure: reaction_pb2.PressureConditions) -> str:
     """Generates a text description of pressure conditions.
 
     Args:
@@ -186,7 +195,7 @@ def _pressure_conditions(pressure):
     return txt
 
 
-def _pressure_conditions_html(pressure):
+def _pressure_conditions_html(pressure: reaction_pb2.PressureConditions) -> str:
     """Generates an HTML-ready description of pressure conditions.
 
     Args:
@@ -212,7 +221,8 @@ def _pressure_conditions_html(pressure):
     return txt
 
 
-def _temperature_conditions(temperature):
+def _temperature_conditions(
+        temperature: reaction_pb2.TemperatureConditions) -> str:
     """Generates a text description of temperature conditions.
 
     Args:
@@ -255,7 +265,8 @@ def _temperature_conditions(temperature):
     return txt + '.'
 
 
-def _temperature_conditions_html(temperature):
+def _temperature_conditions_html(
+        temperature: reaction_pb2.TemperatureConditions) -> str:
     """Generates an HTML-ready description of temperature conditions.
 
     Args:
@@ -275,11 +286,11 @@ def _temperature_conditions_html(temperature):
     return txt
 
 
-def _product_color_texture(product):
+def _product_color_texture(product: reaction_pb2.ProductCompound) -> str:
     """Generates a text description of the color and texture of a product.
 
     Args:
-        product: ReactionProduct message.
+        product: ProductCompound message.
 
     Returns:
         String description of the product.
@@ -303,7 +314,9 @@ def _product_color_texture(product):
     return f'It appeared as a {txt}.'
 
 
-def _selectivity_type(selectivity):
+def _selectivity_type(
+    selectivity: reaction_pb2.ProductMeasurement.Selectivity.SelectivityType
+) -> str:
     """Returns a string version of the selectivity type."""
     return {
         selectivity.CUSTOM: selectivity.details,
@@ -313,7 +326,7 @@ def _selectivity_type(selectivity):
     }[selectivity.type]
 
 
-def _analysis_format(analysis):
+def _analysis_format(analysis: reaction_pb2.Analysis.AnalysisType) -> str:
     """Returns a string version of the analysis type."""
     # TODO(ccoley) include data?
     return {
@@ -340,7 +353,8 @@ def _analysis_format(analysis):
     }[analysis.type]
 
 
-def _compound_svg(compound):
+def _compound_svg(compound: reaction_pb2.Compound,
+                  bond_length: int = 25) -> str:
     """Returns an SVG string for the given compound.
 
     If the compound does not have a structural identifier, a sentinel value
@@ -348,17 +362,25 @@ def _compound_svg(compound):
 
     Args:
         compound: Compound message.
+        bond_length: Bond length in pixels.
 
     Returns:
         String SVG or sentinel value.
     """
-    mol = message_helpers.mol_from_compound(compound)
-    if mol:
-        return drawing.mol_to_svg(mol)
-    return 'no structural identifiers'
+    try:
+        mol = message_helpers.mol_from_compound(compound)
+        if mol:
+            svg = drawing.mol_to_svg(mol, bond_length=bond_length)
+            if svg is None:
+                return (message_helpers.get_compound_smiles(compound) or
+                        '[Compound]')
+            return svg
+    except ValueError:
+        pass
+    return message_helpers.get_compound_smiles(compound) or '[Compound]'
 
 
-def _compound_png(compound):
+def _compound_png(compound: reaction_pb2.Compound) -> str:
     """Returns a PNG string for the given compound.
 
     If the compound does not have a structural identifier, a sentinel value
@@ -370,21 +392,24 @@ def _compound_png(compound):
     Returns:
         String PNG or sentinel value.
     """
-    mol = message_helpers.mol_from_compound(compound)
-    if mol:
-        return drawing.mol_to_png(mol)
-    return 'no structural identifiers'
+    try:
+        mol = message_helpers.mol_from_compound(compound)
+        if mol:
+            return drawing.mol_to_png(mol)
+    except ValueError:
+        pass
+    return message_helpers.get_compound_smiles(compound) or '[Compound]'
 
 
-def _compound_amount(compound):
+def _compound_amount(compound: reaction_pb2.Compound) -> Optional[str]:
     """Returns a string describing the compound amount, if defined."""
-    amount = compound.WhichOneof('amount')
-    if not amount:
+    kind = compound.amount.WhichOneof('kind')
+    if not kind:
         return ''
-    return units.format_message(getattr(compound, amount))
+    return units.format_message(getattr(compound.amount, kind))
 
 
-def _compound_name(compound):
+def _compound_name(compound: reaction_pb2.Compound) -> str:
     """Returns the compound name, if defined."""
     for identifier in compound.identifiers:
         if identifier.type == identifier.NAME:
@@ -392,7 +417,7 @@ def _compound_name(compound):
     return ''
 
 
-def _compound_smiles(compound):
+def _compound_smiles(compound: reaction_pb2.Compound) -> str:
     """Returns the compound SMILES, if defined."""
     for identifier in compound.identifiers:
         if identifier.type == identifier.SMILES:
@@ -400,7 +425,7 @@ def _compound_smiles(compound):
     return ''
 
 
-def _compound_role(compound, text=False):
+def _compound_role(compound: reaction_pb2.Compound, text: bool = False) -> str:
     """Returns a description of the compound role.
 
     Args:
@@ -419,30 +444,41 @@ def _compound_role(compound, text=False):
     limiting = limiting_if_true[compound.is_limiting]
     if text:
         options = {
-            compound.ReactionRole.UNSPECIFIED: '',
-            compound.ReactionRole.REACTANT: f'as a {limiting} reactant',
-            compound.ReactionRole.REAGENT: 'as a reagent',
-            compound.ReactionRole.SOLVENT: 'as a solvent',
-            compound.ReactionRole.CATALYST: 'as a catalyst',
-            compound.ReactionRole.INTERNAL_STANDARD: 'as an internal standard',
-            compound.ReactionRole.WORKUP: '',
-            compound.ReactionRole.PRODUCT: 'as a product',
+            reaction_pb2.ReactionRole.UNSPECIFIED:
+                '',
+            reaction_pb2.ReactionRole.REACTANT:
+                f'as a {limiting} reactant',
+            reaction_pb2.ReactionRole.REAGENT:
+                'as a reagent',
+            reaction_pb2.ReactionRole.SOLVENT:
+                'as a solvent',
+            reaction_pb2.ReactionRole.CATALYST:
+                'as a catalyst',
+            reaction_pb2.ReactionRole.INTERNAL_STANDARD:
+                'as an internal standard',
+            reaction_pb2.ReactionRole.WORKUP:
+                '',
+            reaction_pb2.ReactionRole.AUTHENTIC_STANDARD:
+                'as an authentic standard',
+            reaction_pb2.ReactionRole.PRODUCT:
+                'as a product',
         }
     else:
         options = {
-            compound.ReactionRole.UNSPECIFIED: '',
-            compound.ReactionRole.REACTANT: f'{limiting} reactant',
-            compound.ReactionRole.REAGENT: 'reagent',
-            compound.ReactionRole.SOLVENT: 'solvent',
-            compound.ReactionRole.CATALYST: 'catalyst',
-            compound.ReactionRole.INTERNAL_STANDARD: 'internal standard',
-            compound.ReactionRole.WORKUP: '',
-            compound.ReactionRole.PRODUCT: 'product',
+            reaction_pb2.ReactionRole.UNSPECIFIED: '',
+            reaction_pb2.ReactionRole.REACTANT: f'{limiting} reactant',
+            reaction_pb2.ReactionRole.REAGENT: 'reagent',
+            reaction_pb2.ReactionRole.SOLVENT: 'solvent',
+            reaction_pb2.ReactionRole.CATALYST: 'catalyst',
+            reaction_pb2.ReactionRole.INTERNAL_STANDARD: 'internal standard',
+            reaction_pb2.ReactionRole.WORKUP: '',
+            reaction_pb2.ReactionRole.AUTHENTIC_STANDARD: 'authentic standard',
+            reaction_pb2.ReactionRole.PRODUCT: 'product',
         }
     return options[compound.reaction_role]
 
 
-def _compound_source_prep(compound):
+def _compound_source_prep(compound: reaction_pb2.Compound) -> str:
     """Returns a string describing the compound source and preparation.
 
     Args:
@@ -452,12 +488,12 @@ def _compound_source_prep(compound):
         String description of the source and preparation.
     """
     txt = []
-    if compound.vendor_source:
-        txt.append(f'purchased from {compound.vendor_source}')
-    if compound.vendor_id:
-        txt.append(f'catalog #{compound.vendor_id}')
-    if compound.vendor_lot:
-        txt.append(f'lot #{compound.vendor_lot}')
+    if compound.source.vendor:
+        txt.append(f'purchased from {compound.source.vendor}')
+    if compound.source.id:
+        txt.append(f'catalog #{compound.source.id}')
+    if compound.source.lot:
+        txt.append(f'lot #{compound.source.lot}')
     for preparation in compound.preparations:
         txt.append({
             preparation.UNSPECIFIED: '',
@@ -474,14 +510,26 @@ def _compound_source_prep(compound):
     return ''
 
 
-def _parenthetical_if_def(string):
+def _product_yield(product: reaction_pb2.ProductCompound) -> str:
+    """Returns a string describing how a product yield was calculated."""
+    for measurement in product.measurements:
+        if measurement.type == measurement.YIELD:
+            if measurement.percentage.HasField('value'):
+                string = f'{measurement.percentage.value:0.3f}%'
+                if measurement.percentage.HasField('precision'):
+                    string += f' (± {measurement.percentage.precision:0.3f}%)'
+                return string
+    return ''
+
+
+def _parenthetical_if_def(string: str) -> str:
     """Returns a parenthesized version of a string, if defined."""
     if not string:
         return ''
     return f'({string})'
 
 
-def _vessel_prep(vessel):
+def _vessel_prep(vessel: reaction_pb2.Vessel) -> str:
     """Returns a description of the vessel preparation."""
     preparation_strings = []
     for preparation in vessel.preparations:
@@ -494,14 +542,14 @@ def _vessel_prep(vessel):
     return ', '.join(preparation_strings)
 
 
-def _vessel_size(vessel):
+def _vessel_size(vessel: reaction_pb2.Vessel) -> str:
     """Returns a description of the vessel volume."""
     if vessel.volume.value:
         return f'{units.format_message(vessel.volume)}'
     return ''
 
 
-def _vessel_material(vessel):
+def _vessel_material(vessel: reaction_pb2.Vessel) -> str:
     """Returns a description of the vessel material."""
     return {
         vessel.material.UNSPECIFIED: '',
@@ -512,7 +560,7 @@ def _vessel_material(vessel):
     }[vessel.material.type]
 
 
-def _vessel_type(vessel):
+def _vessel_type(vessel: reaction_pb2.Vessel) -> str:
     """Returns a description of the vessel type.
 
     Args:
@@ -522,28 +570,28 @@ def _vessel_type(vessel):
         String description of the vessel type.
     """
     return {
-        vessel.type.UNSPECIFIED:
+        vessel.UNSPECIFIED:
             'vessel',
-        vessel.type.CUSTOM:
+        vessel.CUSTOM:
             'vessel',
-        vessel.type.ROUND_BOTTOM_FLASK:
+        vessel.ROUND_BOTTOM_FLASK:
             'round bottom flask',
-        vessel.type.VIAL:
+        vessel.VIAL:
             'vial',
-        vessel.type.WELL_PLATE:
+        vessel.WELL_PLATE:
             'well-plate',
-        vessel.type.MICROWAVE_VIAL:
+        vessel.MICROWAVE_VIAL:
             'microwave vial',
-        vessel.type.TUBE:
+        vessel.TUBE:
             'tube',
-        vessel.type.CONTINUOUS_STIRRED_TANK_REACTOR:
+        vessel.CONTINUOUS_STIRRED_TANK_REACTOR:
             'continuous stirred-tank reactor',
-        vessel.type.PACKED_BED_REACTOR:
+        vessel.PACKED_BED_REACTOR:
             'packed bed reactor',
-    }[vessel.type.type]
+    }[vessel.type]
 
 
-def _input_addition(reaction_input):
+def _input_addition(reaction_input: reaction_pb2.ReactionInput) -> str:
     """Returns a description of the addition of a ReactionInput.
 
     Args:
@@ -571,20 +619,63 @@ def _input_addition(reaction_input):
     return ''
 
 
-def _uses_addition_order(reaction):
+def _uses_addition_order(reaction: reaction_pb2.Reaction) -> bool:
     """Returns whether any ReactionInput has a non-zero addition_order."""
     return any(value.addition_order for value in reaction.inputs.values())
 
 
-def _round(value, places=2):
+def _round(value: float, places=2) -> str:
     """Rounds a value to the given number of decimal places."""
     fstring = '{:.%gg}' % places
     return fstring.format(value)
 
 
-def _datetimeformat(value, format_string='%H:%M / %d-%m-%Y'):
+def _datetimeformat(value: datetime.datetime,
+                    format_string: str = '%H:%M / %d-%m-%Y') -> str:
     """Formats a date/time string."""
     return value.strftime(format_string)
+
+
+def _get_compact_components(
+    inputs: Mapping[str, reaction_pb2.ReactionInput]
+) -> Iterable[Tuple[reaction_pb2.Compound, bool]]:
+    """Returns a list of input components for 'compact' visualization.
+
+    Args:
+        inputs: Reaction inputs map.
+
+    Yields:
+        component: Compound message.
+        is_last: Whether this is the last compound that will be displayed.
+    """
+    roles_to_keep = [
+        reaction_pb2.ReactionRole.REACTANT,
+        reaction_pb2.ReactionRole.UNSPECIFIED,
+    ]
+    compounds = []
+    for _, value in _sort_addition_order(inputs):
+        for component in value.components:
+            if component.reaction_role in roles_to_keep:
+                compounds.append(component)
+    for i, compound in enumerate(compounds):
+        if i + 1 == len(compounds):
+            yield compound, True
+        else:
+            yield compound, False
+
+
+def _get_compact_products(
+    products: Iterable[reaction_pb2.ProductCompound]
+) -> List[reaction_pb2.ProductCompound]:
+    """Returns a list of product compounds for 'compact' visualization."""
+    roles_to_keep = [
+        reaction_pb2.ReactionRole.PRODUCT,
+        reaction_pb2.ReactionRole.UNSPECIFIED,
+    ]
+    return [
+        compound for compound in products
+        if compound.reaction_role in roles_to_keep
+    ]
 
 
 TEMPLATE_FILTERS = {
@@ -592,6 +683,8 @@ TEMPLATE_FILTERS = {
     'is_true': _is_true,
     'datetimeformat': _datetimeformat,
     'uses_addition_order': _uses_addition_order,
+    'get_compact_components': _get_compact_components,
+    'get_compact_products': _get_compact_products,
     'input_addition': _input_addition,
     'compound_svg': _compound_svg,
     'compound_png': _compound_png,
@@ -600,6 +693,7 @@ TEMPLATE_FILTERS = {
     'compound_smiles': _compound_smiles,
     'compound_role': _compound_role,
     'compound_source_prep': _compound_source_prep,
+    'product_yield': _product_yield,
     'vessel_prep': _vessel_prep,
     'vessel_type': _vessel_type,
     'vessel_material': _vessel_material,
